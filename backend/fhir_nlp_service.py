@@ -1,264 +1,284 @@
+#!/usr/bin/env python3
+"""
+FHIR NLP Service - Backend for AI on FHIR Take-Home Assessment
+Processes natural language queries and converts them to FHIR API requests
+"""
+
 import re
 import json
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import spacy
+import random
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Load spaCy model (install with: python -m spacy download en_core_web_sm)
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    print("Please install spaCy English model: python -m spacy download en_core_web_sm")
-    nlp = None
-
 app = Flask(__name__)
-CORS(app)  # Enable CORS for React frontend
+CORS(app)
 
 @dataclass
 class QueryIntent:
-    action: str  # "find", "show", "get", etc.
-    resource_type: str  # "patients", "conditions", etc.
-    conditions: List[Dict[str, Any]]
-    age_filter: Optional[Dict[str, Any]] = None
-    count_limit: Optional[int] = None
+    """Represents extracted intent from natural language query"""
+    action: str  # 'find', 'show', 'get', 'list'
+    resource_type: str  # 'patients', 'conditions', 'observations'
+    filters: Dict[str, Any]  # age, gender, condition, etc.
+    modifiers: List[str]  # 'all', 'recent', 'active'
 
 class FHIRNLPProcessor:
+    """Processes natural language queries into FHIR requests"""
+    
     def __init__(self):
         self.condition_mappings = {
-            "diabetes": {"code": "E11", "display": "Type 2 diabetes mellitus", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "diabetic": {"code": "E11", "display": "Type 2 diabetes mellitus", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "hypertension": {"code": "I10", "display": "Essential hypertension", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "high blood pressure": {"code": "I10", "display": "Essential hypertension", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "heart disease": {"code": "I25", "display": "Chronic ischemic heart disease", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "asthma": {"code": "J45", "display": "Asthma", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "cancer": {"code": "C80", "display": "Malignant neoplasm", "system": "http://hl7.org/fhir/sid/icd-10"},
-            "depression": {"code": "F32", "display": "Major depressive disorder", "system": "http://hl7.org/fhir/sid/icd-10"}
+            'diabetes': 'E11.9',
+            'diabetic': 'E11.9',
+            'hypertension': 'I10',
+            'high blood pressure': 'I10',
+            'depression': 'F32.9',
+            'heart disease': 'I25.9',
+            'asthma': 'J45.9',
+            'copd': 'J44.1',
+            'chronic obstructive pulmonary disease': 'J44.1'
         }
         
-        self.age_patterns = [
-            (r"over (\d+)", "gt"),
-            (r"above (\d+)", "gt"),
-            (r"under (\d+)", "lt"),
-            (r"below (\d+)", "lt"),
-            (r"between (\d+) and (\d+)", "range"),
-            (r"(\d+) to (\d+)", "range")
-        ]
+        self.action_patterns = {
+            r'\b(show|display|list|get)\b': 'show',
+            r'\b(find|search|locate)\b': 'find',
+            r'\b(count|how many)\b': 'count'
+        }
+        
+        self.resource_patterns = {
+            r'\bpatients?\b': 'Patient',
+            r'\bconditions?\b': 'Condition',
+            r'\bobservations?\b': 'Observation'
+        }
     
     def extract_intent(self, query: str) -> QueryIntent:
+        """Extract intent and entities from natural language query"""
         query_lower = query.lower()
         
         # Extract action
-        action = "find"
-        if any(word in query_lower for word in ["show", "display", "list"]):
-            action = "show"
-        elif any(word in query_lower for word in ["get", "retrieve", "fetch"]):
-            action = "get"
-        elif any(word in query_lower for word in ["count", "how many"]):
-            action = "count"
-        
-        # Extract resource type
-        resource_type = "Patient"
-        if "patient" in query_lower:
-            resource_type = "Patient"
-        
-        # Extract conditions
-        conditions = []
-        for condition_text, condition_data in self.condition_mappings.items():
-            if condition_text in query_lower:
-                conditions.append(condition_data)
-        
-        # Extract age filters
-        age_filter = None
-        for pattern, filter_type in self.age_patterns:
-            match = re.search(pattern, query_lower)
-            if match:
-                if filter_type == "range":
-                    age_filter = {
-                        "type": "range",
-                        "min": int(match.group(1)),
-                        "max": int(match.group(2))
-                    }
-                else:
-                    age_filter = {
-                        "type": filter_type,
-                        "value": int(match.group(1))
-                    }
+        action = 'show'  # default
+        for pattern, action_type in self.action_patterns.items():
+            if re.search(pattern, query_lower):
+                action = action_type
                 break
         
-        # Extract count limit
-        count_limit = None
-        count_match = re.search(r"(\d+)\s+patients", query_lower)
-        if count_match:
-            count_limit = int(count_match.group(1))
+        # Extract resource type
+        resource_type = 'Patient'  # default
+        for pattern, resource in self.resource_patterns.items():
+            if re.search(pattern, query_lower):
+                resource_type = resource
+                break
         
-        return QueryIntent(
-            action=action,
-            resource_type=resource_type,
-            conditions=conditions,
-            age_filter=age_filter,
-            count_limit=count_limit
-        )
+        # Extract filters
+        filters = {}
+        modifiers = []
+        
+        # Age filters
+        age_match = re.search(r'\b(over|above|older than|greater than)\s+(\d+)\b', query_lower)
+        if age_match:
+            filters['age'] = {'operator': '>', 'value': int(age_match.group(2))}
+        
+        age_match = re.search(r'\b(under|below|younger than|less than)\s+(\d+)\b', query_lower)
+        if age_match:
+            filters['age'] = {'operator': '<', 'value': int(age_match.group(2))}
+        
+        age_match = re.search(r'\bage\s+(\d+)\b', query_lower)
+        if age_match:
+            filters['age'] = {'operator': '=', 'value': int(age_match.group(1))}
+        
+        # Gender filters
+        if re.search(r'\b(male|men)\b', query_lower):
+            filters['gender'] = 'male'
+        elif re.search(r'\b(female|women)\b', query_lower):
+            filters['gender'] = 'female'
+        
+        # Condition filters
+        for condition, code in self.condition_mappings.items():
+            if condition in query_lower:
+                filters['condition'] = {'name': condition, 'code': code}
+                break
+        
+        # Modifiers
+        if re.search(r'\ball\b', query_lower):
+            modifiers.append('all')
+        if re.search(r'\bactive\b', query_lower):
+            modifiers.append('active')
+        if re.search(r'\brecent\b', query_lower):
+            modifiers.append('recent')
+        
+        return QueryIntent(action, resource_type, filters, modifiers)
     
     def build_fhir_query(self, intent: QueryIntent) -> Dict[str, Any]:
         """Convert intent to FHIR API query parameters"""
-        query_params = {
-            "resourceType": intent.resource_type
-        }
+        query_params = {}
         
-        # Add condition filters
-        if intent.conditions:
-            condition_codes = [f"{cond['system']}|{cond['code']}" for cond in intent.conditions]
-            query_params["condition"] = ",".join(condition_codes)
+        # Base resource
+        query_params['resourceType'] = intent.resource_type
         
-        # Add age filters
-        if intent.age_filter:
-            if intent.age_filter["type"] == "gt":
-                query_params["birthdate"] = f"le{(datetime.now() - timedelta(days=365*intent.age_filter['value'])).strftime('%Y-%m-%d')}"
-            elif intent.age_filter["type"] == "lt":
-                query_params["birthdate"] = f"ge{(datetime.now() - timedelta(days=365*intent.age_filter['value'])).strftime('%Y-%m-%d')}"
-            elif intent.age_filter["type"] == "range":
-                min_date = (datetime.now() - timedelta(days=365*intent.age_filter['max'])).strftime('%Y-%m-%d')
-                max_date = (datetime.now() - timedelta(days=365*intent.age_filter['min'])).strftime('%Y-%m-%d')
-                query_params["birthdate"] = f"ge{min_date}&birthdate=le{max_date}"
+        # Age filters
+        if 'age' in intent.filters:
+            age_filter = intent.filters['age']
+            current_year = datetime.now().year
+            birth_year = current_year - age_filter['value']
+            
+            if age_filter['operator'] == '>':
+                query_params['birthdate'] = f'lt{birth_year}-01-01'
+            elif age_filter['operator'] == '<':
+                query_params['birthdate'] = f'gt{birth_year}-01-01'
+            else:
+                query_params['birthdate'] = f'ge{birth_year}-01-01&birthdate=lt{birth_year+1}-01-01'
         
-        # Add count limit
-        if intent.count_limit:
-            query_params["_count"] = intent.count_limit
+        # Gender filters
+        if 'gender' in intent.filters:
+            query_params['gender'] = intent.filters['gender']
+        
+        # Condition filters
+        if 'condition' in intent.filters:
+            condition = intent.filters['condition']
+            if intent.resource_type == 'Patient':
+                query_params['_has:Condition:patient:code'] = condition['code']
+            elif intent.resource_type == 'Condition':
+                query_params['code'] = condition['code']
+        
+        # Modifiers
+        if 'active' in intent.modifiers:
+            query_params['clinical-status'] = 'active'
+        
+        if 'recent' in intent.modifiers:
+            recent_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+            query_params['date'] = f'ge{recent_date}'
         
         return query_params
     
-    def generate_mock_fhir_response(self, intent: QueryIntent) -> Dict[str, Any]:
-        """Generate mock FHIR Bundle response based on query intent"""
-        patients = []
+    def generate_mock_fhir_response(self, intent: QueryIntent, query_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate mock FHIR response based on query"""
         
-        # Generate mock patients based on conditions and filters
-        base_patients = [
-            {"id": "1", "name": "John Doe", "birthDate": "1970-05-15", "gender": "male"},
-            {"id": "2", "name": "Jane Smith", "birthDate": "1965-08-22", "gender": "female"},
-            {"id": "3", "name": "Robert Johnson", "birthDate": "1980-12-03", "gender": "male"},
-            {"id": "4", "name": "Mary Williams", "birthDate": "1955-03-10", "gender": "female"},
-            {"id": "5", "name": "David Brown", "birthDate": "1975-11-28", "gender": "male"},
-        ]
+        # Generate mock patients
+        mock_patients = []
+        num_patients = random.randint(5, 15)
         
-        for patient in base_patients:
-            # Calculate age
-            birth_year = int(patient["birthDate"][:4])
-            age = 2025 - birth_year
+        for i in range(num_patients):
+            age = random.randint(25, 85)
+            gender = random.choice(['male', 'female'])
             
-            # Apply age filter
-            if intent.age_filter:
-                if intent.age_filter["type"] == "gt" and age <= intent.age_filter["value"]:
+            # Apply filters
+            if 'age' in intent.filters:
+                age_filter = intent.filters['age']
+                if age_filter['operator'] == '>' and age <= age_filter['value']:
                     continue
-                elif intent.age_filter["type"] == "lt" and age >= intent.age_filter["value"]:
+                elif age_filter['operator'] == '<' and age >= age_filter['value']:
                     continue
-                elif intent.age_filter["type"] == "range":
-                    if age < intent.age_filter["min"] or age > intent.age_filter["max"]:
-                        continue
+                elif age_filter['operator'] == '=' and age != age_filter['value']:
+                    continue
             
-            # Add conditions if specified
-            conditions = []
-            if intent.conditions:
-                for condition in intent.conditions:
-                    conditions.append({
-                        "code": {
-                            "coding": [{
-                                "system": condition["system"],
-                                "code": condition["code"],
-                                "display": condition["display"]
-                            }]
-                        },
-                        "subject": {"reference": f"Patient/{patient['id']}"}
-                    })
+            if 'gender' in intent.filters and gender != intent.filters['gender']:
+                continue
             
-            patient_resource = {
-                "resourceType": "Patient",
-                "id": patient["id"],
-                "name": [{"given": [patient["name"].split()[0]], "family": patient["name"].split()[1]}],
-                "birthDate": patient["birthDate"],
-                "gender": patient["gender"],
-                "conditions": conditions,
-                "age": age
+            patient = {
+                'resourceType': 'Patient',
+                'id': f'patient-{i+1}',
+                'name': [{
+                    'use': 'official',
+                    'family': random.choice(['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez']),
+                    'given': [random.choice(['John', 'Jane', 'Michael', 'Sarah', 'David', 'Lisa', 'Chris', 'Amanda', 'Robert', 'Jennifer'])]
+                }],
+                'gender': gender,
+                'birthDate': f'{datetime.now().year - age}-{random.randint(1,12):02d}-{random.randint(1,28):02d}',
+                'age': age
             }
             
-            patients.append(patient_resource)
+            if 'condition' in intent.filters:
+                condition = intent.filters['condition']
+                patient['conditions'] = [{
+                    'code': condition['code'],
+                    'display': condition['name'].title()
+                }]
             
-            # Apply count limit
-            if intent.count_limit and len(patients) >= intent.count_limit:
-                break
+            mock_patients.append(patient)
         
         return {
-            "resourceType": "Bundle",
-            "type": "searchset",
-            "total": len(patients),
-            "entry": [{"resource": patient} for patient in patients]
+            'resourceType': 'Bundle',
+            'type': 'searchset',
+            'total': len(mock_patients),
+            'entry': [{'resource': patient} for patient in mock_patients]
         }
 
 # Initialize processor
 processor = FHIRNLPProcessor()
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
 @app.route('/query', methods=['POST'])
 def process_query():
-    data = request.get_json()
-    query_text = data.get('query', '')
-    
-    if not query_text:
-        return jsonify({"error": "Query text is required"}), 400
-    
+    """Process natural language query and return FHIR response"""
     try:
+        data = request.get_json()
+        if not data or 'query' not in data:
+            return jsonify({'error': 'Missing query parameter'}), 400
+        
+        query = data['query']
+        
         # Extract intent
-        intent = processor.extract_intent(query_text)
+        intent = processor.extract_intent(query)
         
         # Build FHIR query
         fhir_query = processor.build_fhir_query(intent)
         
         # Generate mock response
-        mock_response = processor.generate_mock_fhir_response(intent)
+        mock_response = processor.generate_mock_fhir_response(intent, fhir_query)
         
         return jsonify({
-            "original_query": query_text,
-            "extracted_intent": {
-                "action": intent.action,
-                "resource_type": intent.resource_type,
-                "conditions": intent.conditions,
-                "age_filter": intent.age_filter,
-                "count_limit": intent.count_limit
+            'original_query': query,
+            'extracted_intent': {
+                'action': intent.action,
+                'resource_type': intent.resource_type,
+                'filters': intent.filters,
+                'modifiers': intent.modifiers
             },
-            "fhir_query_params": fhir_query,
-            "mock_fhir_response": mock_response
+            'fhir_query': fhir_query,
+            'fhir_response': mock_response
         })
     
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({"status": "healthy", "service": "FHIR NLP Processor"})
+@app.route('/examples', methods=['GET'])
+def get_examples():
+    """Get example queries for testing"""
+    examples = [
+        "Show me all diabetic patients over 50",
+        "Find female patients with hypertension",
+        "List patients under 30 with depression",
+        "Show male patients with heart disease over 65",
+        "Get all active asthma patients"
+    ]
+    return jsonify({'examples': examples})
 
 if __name__ == '__main__':
-    # Example usage
+    print("Starting FHIR NLP Service...")
+    print("Available endpoints:")
+    print("  GET  /health - Health check")
+    print("  POST /query - Process natural language query")
+    print("  GET  /examples - Get example queries")
+    print()
+    
+    # Test with example queries
+    print("Testing with example queries:")
     test_queries = [
         "Show me all diabetic patients over 50",
-        "Find patients with hypertension under 65",
-        "Get all patients with heart disease between 40 and 70",
-        "How many patients have asthma?",
-        "List 3 patients with depression"
+        "Find female patients with hypertension",
+        "List patients under 30"
     ]
-    
-    print("Testing NLP to FHIR conversion:")
-    print("=" * 50)
     
     for query in test_queries:
         print(f"\nQuery: {query}")
         intent = processor.extract_intent(query)
         fhir_query = processor.build_fhir_query(intent)
-        mock_response = processor.generate_mock_fhir_response(intent)
-        
         print(f"Intent: {intent}")
         print(f"FHIR Query: {fhir_query}")
-        print(f"Results: {mock_response['total']} patients found")
     
-    print("\nStarting Flask server...")
-    app.run(debug=True, port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5050)
